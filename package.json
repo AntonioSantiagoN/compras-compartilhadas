@@ -1,0 +1,11 @@
+{
+  "name": "compras-compartilhadas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lista colaborativa de compras com lotes automáticos de 4 participantes",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {"node": ">=22.13"}
+}

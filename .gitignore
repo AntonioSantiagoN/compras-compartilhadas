@@ -1,0 +1,4 @@
+compras.sqlite
+compras.sqlite-*
+.env
+node_modules/
