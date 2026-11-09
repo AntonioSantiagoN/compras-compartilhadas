@@ -7,5 +7,10 @@
     "start": "node server.js",
     "test": "node --test"
   },
-  "engines": {"node": ">=22.13"}
+  "engines": {
+    "node": ">=20.12"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
+  }
 }

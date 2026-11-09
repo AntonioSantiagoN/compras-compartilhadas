@@ -1,43 +1,81 @@
 'use strict';
+// Rodando localmente (`npm start`), carrega variáveis do arquivo .env, se existir.
+if (require.main === module) { try { process.loadEnvFile(); } catch {} }
+
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { Pool } = require('pg');
 
 const PORT = Number(process.env.PORT || 3000);
-const USER_PASSWORD = process.env.USER_PASSWORD || 'teste123';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'adm1234!';
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
-// No Railway, o banco fica no Volume montado (persistente entre deploys e reinícios).
-const ON_RAILWAY = Boolean(process.env.RAILWAY_ENVIRONMENT);
-const VOLUME_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH;
-const DB_FILE = process.env.DB_FILE || path.join(VOLUME_DIR || __dirname, 'compras.sqlite');
-const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production' || ON_RAILWAY;
-if (ON_RAILWAY) {
-  if (!VOLUME_DIR && !process.env.DB_FILE) console.warn('AVISO: nenhum Volume do Railway montado. Os dados serão APAGADOS a cada deploy. Crie um Volume no serviço.');
-  if (!process.env.USER_PASSWORD || !process.env.ADMIN_PASSWORD) console.warn('AVISO: USER_PASSWORD/ADMIN_PASSWORD não definidas; usando as senhas padrão públicas do repositório.');
-  if (!process.env.SESSION_SECRET) console.warn('AVISO: SESSION_SECRET não definida; todos serão deslogados a cada reinício.');
-}
-fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+const ON_VERCEL = Boolean(process.env.VERCEL);
+const DATABASE_URL = process.env.DATABASE_URL;
+const USER_PASSWORD = process.env.USER_PASSWORD || (ON_VERCEL ? '' : 'teste123');
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (ON_VERCEL ? '' : 'adm1234!');
+const SESSION_SECRET = process.env.SESSION_SECRET || (ON_VERCEL ? '' : crypto.randomBytes(32).toString('hex'));
+const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production' || ON_VERCEL;
 const root = path.join(__dirname, 'public');
-const db = new DatabaseSync(DB_FILE);
-db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
+
+// Na Vercel não há senhas padrão: sem estas variáveis o site recusa funcionar.
+const missingConfig = [
+  !DATABASE_URL && 'DATABASE_URL',
+  !USER_PASSWORD && 'USER_PASSWORD',
+  !ADMIN_PASSWORD && 'ADMIN_PASSWORD',
+  !SESSION_SECRET && 'SESSION_SECRET',
+].filter(Boolean);
+if (missingConfig.length) console.error('Configuração incompleta. Defina: ' + missingConfig.join(', '));
+
+// Banco PostgreSQL (no Railway). Conexões locais não usam SSL; remotas usam
+// SSL sem validar o certificado, pois o Postgres do Railway usa certificado próprio.
+const isLocalDb = /@(localhost|127\.0\.0\.1)(:|\/)/.test(DATABASE_URL || '');
+const pool = DATABASE_URL ? new Pool({
+  connectionString: DATABASE_URL,
+  ssl: isLocalDb || process.env.PGSSL === 'disable' ? false : { rejectUnauthorized: false },
+  max: ON_VERCEL ? 3 : 10,
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 10000,
+}) : null;
+if (pool) pool.on('error', err => console.error('Erro na conexão com o banco:', err.message));
+
+const SCHEMA = `
 CREATE TABLE IF NOT EXISTS lists (
- id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+ id SERIAL PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
  starts_at TEXT NOT NULL, duration_days INTEGER NOT NULL, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS products (
- id INTEGER PRIMARY KEY AUTOINCREMENT, list_id INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+ id SERIAL PRIMARY KEY, list_id INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
  name TEXT NOT NULL, position INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS registrations (
- id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+ id SERIAL PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
  lot INTEGER NOT NULL, name TEXT NOT NULL, phone TEXT NOT NULL, quantity INTEGER NOT NULL,
  created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reg_product_lot ON registrations(product_id, lot);
-`);
+CREATE INDEX IF NOT EXISTS idx_products_list ON products(list_id);
+`;
+let schemaReady = null;
+function ensureSchema() {
+  // Cria as tabelas na primeira requisição de cada instância; tenta de novo se falhar.
+  if (!schemaReady) schemaReady = pool.query(SCHEMA).catch(err => { schemaReady = null; throw err; });
+  return schemaReady;
+}
+const query = async (text, params) => (await pool.query(text, params)).rows;
+async function transaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn((text, params) => client.query(text, params).then(r => r.rows));
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally { client.release(); }
+}
+// Erro "esperado" que encerra a transação e vira uma resposta ao usuário.
+const httpError = (status, message) => Object.assign(new Error(message), { status });
 
 const now = () => new Date().toISOString();
 const json = (res, status, value) => {
@@ -67,25 +105,25 @@ function auth(req, res, admin = false) {
 }
 async function body(req) {
   let bytes = 0, chunks = [];
-  for await (const chunk of req) { bytes += chunk.length; if (bytes > 32768) throw Object.assign(new Error('Dados muito grandes.'), { status: 413 }); chunks.push(chunk); }
-  try { return JSON.parse(Buffer.concat(chunks).toString() || '{}'); } catch { throw Object.assign(new Error('Dados inválidos.'), { status: 400 }); }
+  for await (const chunk of req) { bytes += chunk.length; if (bytes > 32768) throw httpError(413, 'Dados muito grandes.'); chunks.push(chunk); }
+  try { return JSON.parse(Buffer.concat(chunks).toString() || '{}'); } catch { throw httpError(400, 'Dados inválidos.'); }
 }
 const clean = (s, max) => typeof s === 'string' ? s.trim().slice(0, max) : '';
-const getList = id => db.prepare('SELECT * FROM lists WHERE id=?').get(id);
-const getProduct = id => db.prepare('SELECT p.*, l.starts_at, l.duration_days FROM products p JOIN lists l ON l.id=p.list_id WHERE p.id=?').get(id);
 const endOf = list => new Date(Date.parse(list.starts_at) + list.duration_days * 86400000).toISOString();
 const isOpen = list => Date.now() >= Date.parse(list.starts_at) && Date.now() < Date.parse(endOf(list));
+// Na Vercel a memória não é compartilhada entre instâncias, então este limite é aproximado.
 const attempts = new Map();
 function rateLimit(ip) {
   const t = Date.now(); const entry = attempts.get(ip) || { count: 0, until: t + 60000 };
   if (entry.until < t) { entry.count = 0; entry.until = t + 60000; }
   entry.count++; attempts.set(ip, entry); return entry.count <= 20;
 }
-function listDetails(id) {
-  const list = getList(id); if (!list) return null;
-  const products = db.prepare('SELECT * FROM products WHERE list_id=? ORDER BY position,id').all(id);
-  const rows = db.prepare(`SELECT r.id,r.product_id,r.lot,r.name,r.phone,r.quantity,r.created_at
-    FROM registrations r JOIN products p ON p.id=r.product_id WHERE p.list_id=? ORDER BY r.product_id,r.lot,r.id`).all(id);
+const clientIp = req => (ON_VERCEL && req.headers['x-real-ip']) || req.socket.remoteAddress || 'unknown';
+async function listDetails(id) {
+  const [list] = await query('SELECT * FROM lists WHERE id=$1', [id]); if (!list) return null;
+  const products = await query('SELECT * FROM products WHERE list_id=$1 ORDER BY position,id', [id]);
+  const rows = await query(`SELECT r.id,r.product_id,r.lot,r.name,r.phone,r.quantity,r.created_at
+    FROM registrations r JOIN products p ON p.id=r.product_id WHERE p.list_id=$1 ORDER BY r.product_id,r.lot,r.id`, [id]);
   return { ...list, ends_at: endOf(list), open: isOpen(list), products: products.map(p => {
     const records = rows.filter(r => r.product_id === p.id);
     const largest = records.length ? Math.max(...records.map(r => r.lot)) : 1;
@@ -98,7 +136,7 @@ async function api(req, res, url) {
   const method = req.method;
   if (url.pathname === '/api/session' && method === 'GET') return json(res, 200, { role: roleFrom(req) });
   if (url.pathname === '/api/login' && method === 'POST') {
-    if (!rateLimit(req.socket.remoteAddress || 'unknown')) return json(res, 429, { error: 'Muitas tentativas. Tente novamente em um minuto.' });
+    if (!rateLimit(clientIp(req))) return json(res, 429, { error: 'Muitas tentativas. Tente novamente em um minuto.' });
     const data = await body(req);
     const role = secureEq(data.password || '', ADMIN_PASSWORD) ? 'admin' : secureEq(data.password || '', USER_PASSWORD) ? 'user' : null;
     if (!role) return json(res, 401, { error: 'Senha incorreta.' });
@@ -110,8 +148,9 @@ async function api(req, res, url) {
     return json(res, 200, { ok: true });
   }
   if (!auth(req, res)) return;
+  await ensureSchema();
   if (url.pathname === '/api/lists' && method === 'GET') {
-    const lists = db.prepare('SELECT * FROM lists ORDER BY id DESC').all().map(l => ({ ...l, ends_at: endOf(l), open: isOpen(l) }));
+    const lists = (await query('SELECT * FROM lists ORDER BY id DESC')).map(l => ({ ...l, ends_at: endOf(l), open: isOpen(l) }));
     return json(res, 200, { lists });
   }
   if (url.pathname === '/api/lists' && method === 'POST') {
@@ -123,65 +162,70 @@ async function api(req, res, url) {
     const productNames = Array.isArray(data.products) ? data.products.map(x => clean(x, 100)).filter(Boolean) : [];
     if (!title || !Number.isFinite(startsAt) || !Number.isInteger(durationDays) || durationDays < 1 || durationDays > 365 || !productNames.length || productNames.length > 40)
       return json(res, 400, { error: 'Informe título, início, duração (1 a 365 dias) e pelo menos um produto.' });
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const created = db.prepare('INSERT INTO lists(title, description, starts_at, duration_days, created_at) VALUES(?,?,?,?,?)').run(title, description, new Date(startsAt).toISOString(), durationDays, now());
-      const p = db.prepare('INSERT INTO products(list_id,name,position) VALUES(?,?,?)');
-      productNames.forEach((name, index) => p.run(created.lastInsertRowid, name, index));
-      db.exec('COMMIT');
-      return json(res, 201, { id: Number(created.lastInsertRowid) });
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    const id = await transaction(async q => {
+      const [created] = await q('INSERT INTO lists(title, description, starts_at, duration_days, created_at) VALUES($1,$2,$3,$4,$5) RETURNING id',
+        [title, description, new Date(startsAt).toISOString(), durationDays, now()]);
+      for (const [index, name] of productNames.entries()) await q('INSERT INTO products(list_id,name,position) VALUES($1,$2,$3)', [created.id, name, index]);
+      return created.id;
+    });
+    return json(res, 201, { id });
   }
   const matchList = url.pathname.match(/^\/api\/lists\/(\d+)$/);
-  if (matchList && method === 'GET') { const item = listDetails(Number(matchList[1])); return item ? json(res, 200, { list: item }) : json(res, 404, { error: 'Lista não encontrada.' }); }
+  if (matchList && method === 'GET') { const item = await listDetails(Number(matchList[1])); return item ? json(res, 200, { list: item }) : json(res, 404, { error: 'Lista não encontrada.' }); }
   const matchRegistration = url.pathname.match(/^\/api\/products\/(\d+)\/register$/);
   if (matchRegistration && method === 'POST') {
     const productId = Number(matchRegistration[1]);
     const data = await body(req), name = clean(data.name, 90), phone = clean(data.phone, 30), quantity = Number(data.quantity);
     if (name.length < 2 || !/^\+?[\d\s()\-]{8,22}$/.test(phone) || !Number.isInteger(quantity) || quantity < 1 || quantity > 10000)
       return json(res, 400, { error: 'Informe nome, telefone válido e quantidade entre 1 e 10.000.' });
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const product = getProduct(productId);
-      if (!product) { db.exec('ROLLBACK'); return json(res, 404, { error: 'Produto não encontrado.' }); }
-      if (!isOpen(product)) { db.exec('ROLLBACK'); return json(res, 400, { error: 'Esta lista ainda não começou ou já encerrou.' }); }
+    const result = await transaction(async q => {
+      // FOR UPDATE trava o produto: inscrições simultâneas no mesmo produto entram uma de cada vez,
+      // então a contagem de lotes nunca é calculada em duplicidade.
+      const [product] = await q('SELECT p.id, l.starts_at, l.duration_days FROM products p JOIN lists l ON l.id=p.list_id WHERE p.id=$1 FOR UPDATE OF p', [productId]);
+      if (!product) throw httpError(404, 'Produto não encontrado.');
+      if (!isOpen(product)) throw httpError(400, 'Esta lista ainda não começou ou já encerrou.');
       // Uma compra por telefone e produto em cada lista; evita duplicações acidentais.
       const normalized = phone.replace(/\D/g, '');
-      const existing = db.prepare('SELECT phone FROM registrations WHERE product_id=?').all(productId);
-      if (existing.some(r => r.phone.replace(/\D/g, '') === normalized)) { db.exec('ROLLBACK'); return json(res, 409, { error: 'Este telefone já está cadastrado neste produto. Peça ao administrador para corrigir.' }); }
-      const count = db.prepare('SELECT COUNT(*) AS n FROM registrations WHERE product_id=?').get(productId).n;
-      const lot = Math.floor(count / 4) + 1;
-      const inserted = db.prepare('INSERT INTO registrations(product_id,lot,name,phone,quantity,created_at) VALUES(?,?,?,?,?,?)').run(productId, lot, name, phone, quantity, now());
-      db.exec('COMMIT');
-      return json(res, 201, { id: Number(inserted.lastInsertRowid), lot });
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
+      const existing = await q('SELECT phone FROM registrations WHERE product_id=$1', [productId]);
+      if (existing.some(r => r.phone.replace(/\D/g, '') === normalized)) throw httpError(409, 'Este telefone já está cadastrado neste produto. Peça ao administrador para corrigir.');
+      const lot = Math.floor(existing.length / 4) + 1;
+      const [inserted] = await q('INSERT INTO registrations(product_id,lot,name,phone,quantity,created_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING id', [productId, lot, name, phone, quantity, now()]);
+      return { id: inserted.id, lot };
+    });
+    return json(res, 201, result);
   }
   const deleteReg = url.pathname.match(/^\/api\/registrations\/(\d+)$/);
   if (deleteReg && method === 'DELETE') {
     if (!auth(req, res, true)) return;
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const reg = db.prepare('SELECT product_id FROM registrations WHERE id=?').get(Number(deleteReg[1]));
-      if (!reg) { db.exec('ROLLBACK'); return json(res, 404, { error: 'Inscrição não encontrada.' }); }
-      db.prepare('DELETE FROM registrations WHERE id=?').run(Number(deleteReg[1]));
+    const regId = Number(deleteReg[1]);
+    await transaction(async q => {
+      const [reg] = await q('SELECT product_id FROM registrations WHERE id=$1', [regId]);
+      if (!reg) throw httpError(404, 'Inscrição não encontrada.');
+      await q('SELECT id FROM products WHERE id=$1 FOR UPDATE', [reg.product_id]);
+      const deleted = await q('DELETE FROM registrations WHERE id=$1 RETURNING id', [regId]);
+      if (!deleted.length) throw httpError(404, 'Inscrição não encontrada.');
       // Reenumera lotes mantendo a sequência de inscrições após exclusões.
-      const others = db.prepare('SELECT id FROM registrations WHERE product_id=? ORDER BY id').all(reg.product_id);
-      const update = db.prepare('UPDATE registrations SET lot=? WHERE id=?');
-      others.forEach((r, i) => update.run(Math.floor(i / 4) + 1, r.id));
-      db.exec('COMMIT'); return json(res, 200, { ok: true });
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
+      const others = await q('SELECT id FROM registrations WHERE product_id=$1 ORDER BY id', [reg.product_id]);
+      for (const [i, r] of others.entries()) await q('UPDATE registrations SET lot=$1 WHERE id=$2', [Math.floor(i / 4) + 1, r.id]);
+    });
+    return json(res, 200, { ok: true });
   }
   return json(res, 404, { error: 'Endereço não encontrado.' });
 }
 const mime = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml' };
-const server = http.createServer(async (req, res) => {
+// Atende a API e, rodando localmente, também os arquivos de /public.
+// Na Vercel, /public é servido direto pela CDN e só /api/* chega aqui (via api/index.js).
+async function handler(req, res) {
   try {
     const url = new URL(req.url, 'http://localhost');
     if (['POST', 'DELETE', 'PATCH', 'PUT'].includes(req.method)) {
       const origin = req.headers.origin;
       if (origin && new URL(origin).host !== req.headers.host) return json(res, 403, { error: 'Origem não permitida.' });
     }
-    if (url.pathname.startsWith('/api/')) return await api(req, res, url);
+    if (url.pathname.startsWith('/api/')) {
+      if (missingConfig.length) return json(res, 500, { error: 'Servidor sem configuração completa. Avise o administrador.' });
+      return await api(req, res, url);
+    }
     if (req.method !== 'GET') return json(res, 405, { error: 'Método não permitido.' });
     const item = url.pathname === '/' ? '/index.html' : url.pathname;
     const resolved = path.resolve(root, '.' + decodeURIComponent(item));
@@ -190,7 +234,11 @@ const server = http.createServer(async (req, res) => {
       if (err) { res.writeHead(404); return res.end('Não encontrado'); }
       res.writeHead(200, { 'Content-Type': mime[path.extname(resolved)] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff' }); res.end(data);
     });
-  } catch (err) { console.error(err); json(res, err.status || 500, { error: err.status ? err.message : 'Ocorreu um erro. Tente novamente.' }); }
-});
+  } catch (err) {
+    if (!err.status) console.error(err);
+    if (!res.headersSent) json(res, err.status || 500, { error: err.status ? err.message : 'Ocorreu um erro. Tente novamente.' });
+  }
+}
+const server = http.createServer(handler);
 if (require.main === module) server.listen(PORT, '0.0.0.0', () => console.log(`Compras Compartilhadas disponível em http://localhost:${PORT}`));
-module.exports = { server, db };
+module.exports = { handler, server, pool };
