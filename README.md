@@ -19,7 +19,24 @@ Requer **Node.js 22.13 ou superior**. Não precisa instalar bibliotecas.
 4. Acesse com `adm1234!`, clique em **Nova lista** e informe nome, início, duração em dias e produtos (um por linha).
 5. Compartilhe o link hospedado com o grupo; para acesso em aparelhos diferentes, será preciso hospedar este servidor em um local com endereço público (ou configurar acesso na mesma rede local).
 
-### Configuração para publicação
+### Publicar no Railway
+
+O projeto já vem preparado (`railway.json`). O banco SQLite fica gravado num **Volume** do Railway, que não se apaga entre deploys.
+
+1. Em [railway.com](https://railway.com), entre com o GitHub e clique em **New Project → Deploy from GitHub repo** → `compras-compartilhadas`.
+2. No serviço criado, clique com o botão direito (ou `Ctrl+K`) → **Add Volume** e use o caminho de montagem `/data`. O servidor detecta o Volume sozinho (`RAILWAY_VOLUME_MOUNT_PATH`) e grava `compras.sqlite` nele.
+3. Na aba **Variables**, cadastre:
+   ```
+   USER_PASSWORD=senha-dos-participantes
+   ADMIN_PASSWORD=senha-do-administrador
+   SESSION_SECRET=texto-longo-e-aleatorio-com-pelo-menos-32-caracteres
+   ```
+4. Na aba **Settings → Networking**, clique em **Generate Domain** para ganhar o endereço público (HTTPS).
+5. A cada `git push` na branch `main`, o Railway publica a nova versão automaticamente.
+
+Os logs do deploy mostram avisos se faltar o Volume, as senhas ou a `SESSION_SECRET`.
+
+### Configuração para publicação (outros serviços)
 
 Configure estas variáveis no serviço de hospedagem:
 

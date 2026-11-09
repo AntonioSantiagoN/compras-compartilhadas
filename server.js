@@ -9,8 +9,17 @@ const PORT = Number(process.env.PORT || 3000);
 const USER_PASSWORD = process.env.USER_PASSWORD || 'teste123';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'adm1234!';
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
-const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'compras.sqlite');
-const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production';
+// No Railway, o banco fica no Volume montado (persistente entre deploys e reinícios).
+const ON_RAILWAY = Boolean(process.env.RAILWAY_ENVIRONMENT);
+const VOLUME_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+const DB_FILE = process.env.DB_FILE || path.join(VOLUME_DIR || __dirname, 'compras.sqlite');
+const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production' || ON_RAILWAY;
+if (ON_RAILWAY) {
+  if (!VOLUME_DIR && !process.env.DB_FILE) console.warn('AVISO: nenhum Volume do Railway montado. Os dados serão APAGADOS a cada deploy. Crie um Volume no serviço.');
+  if (!process.env.USER_PASSWORD || !process.env.ADMIN_PASSWORD) console.warn('AVISO: USER_PASSWORD/ADMIN_PASSWORD não definidas; usando as senhas padrão públicas do repositório.');
+  if (!process.env.SESSION_SECRET) console.warn('AVISO: SESSION_SECRET não definida; todos serão deslogados a cada reinício.');
+}
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
 const root = path.join(__dirname, 'public');
 const db = new DatabaseSync(DB_FILE);
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
